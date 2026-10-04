@@ -1,56 +1,121 @@
-name: Build Kernel A146M Hunter
+name: Build Hunter Kernel
+
 on:
-  workflow_dispatch: 
+  push:
+    branches: [ main, master ]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch: # Permite rodar manualmente 👍
 
 jobs:
-  build-kernel:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        # Adicione outras configs se tiver mais dispositivos
+        defconfig: [ hunter_defconfig ]
+
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
 
-      - name: Install Dependencies
-        run: |
-          sudo apt update && sudo apt install -y bc bison flex libssl-dev zip git wget make cpio xz-utils
+    - name: Setup Environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          bc \
+          bison \
+          flex \
+          libssl-dev \
+          libelf-dev \
+          dwarves \
+          lz4 \
+          zstd \
+          cpio \
+          rsync \
+          wget \
+          curl \
+          git
 
-      - name: Clone Kernel Source & Toolchain
-        run: |
-          git clone https://github.com/devhunter1/android_kernel_samsung_s5e8535 kernel-source
-          mkdir toolchain && cd toolchain
-          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r450784d.tar.gz
-          tar xf clang-r450784d.tar.gz
-          
-      - name: Apply Performance Patches to Defconfig
-        run: |
-          cd kernel-source
-          # Carrega a config base do Hunter
-          make ARCH=arm64 CC=$(pwd)/../toolchain/bin/clang hunter_defconfig
-          
-          # Aplica as otimizações via scripts/config
-          scripts/config --enable CONFIG_CPU_FREQ_GOV_ENERGYAWARE
-          scripts/config --enable CONFIG_CPU_FREQ_GOV_USERSPACE
-          scripts/config --disable CONFIG_THERMAL_DEFAULT_GOV_STEP_WISE
-          scripts/config --enable CONFIG_THERMAL_DEFAULT_GOV_POWER_ALLOCATOR
-          scripts/config --enable CONFIG_MALI_EXYNOS_INTERACTIVE_BOOST
-          scripts/config --disable CONFIG_ZRAM_DEF_COMP_LZORLE
-          scripts/config --enable CONFIG_ZRAM_DEF_COMP_LZ4
-          scripts/config --set-str CONFIG_ZRAM_DEF_COMP "lz4"
-          scripts/config --set-str CONFIG_DEFAULT_TCP_CONG "bbr"
-          scripts/config --disable CONFIG_DEBUG_INFO
-          scripts/config --disable CONFIG_KASAN
-          
-          # Salva as mudanças
-          make ARCH=arm64 CC=$(pwd)/../toolchain/bin/clang olddefconfig
+    - name: Download Toolchain (Clang 14 / LLVM)
+      run: |
+        # Baixa o Clang compatível com o config (r450784d / 14.0.6)
+        # Usando uma versão genérica do LLVM 14 para garantir compatibilidade
+        wget https://github.com/llvm/llvm-project/releases/download/llvmorg-14.0.6/clang+llvm-14.0.6-x86_64-linux-gnu-ubuntu-18.04.tar.xz
+        tar xf clang+llvm-14.0.6-x86_64-linux-gnu-ubuntu-18.04.tar.xz
+        echo "$(pwd)/clang+llvm-14.0.6-x86_64-linux-gnu-ubuntu-18.04/bin" >> $GITHUB_PATH
+        
+        # Verifica versões
+        clang --version
+        ld.lld --version
 
-      - name: Compile Kernel
-        run: |
-          cd kernel-source
-          export PATH=$(pwd)/../toolchain/bin:$PATH
-          export CLANG_TRIPLE=aarch64-linux-gnu-
-          make ARCH=arm64 CC=clang -j$(nproc)
+    - name: Prepare Kernel Source
+      run: |
+        export ARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        export CC=clang
+        export LD=ld.lld
+        export AR=llvm-ar
+        export NM=llvm-nm
+        export OBJCOPY=llvm-objcopy
+        export OBJDUMP=llvm-objdump
+        export STRIP=llvm-strip
+        
+        # Instala cross-compile básico para headers/libs se necessário
+        sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
 
-      - name: Upload Kernel Image
-        uses: actions/upload-artifact@v4
-        with:
-          name: hunter-kernel-a146m
-          path: kernel-source/arch/arm64/boot/Image
+    - name: Configure Kernel
+      run: |
+        export ARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        export CC=clang
+        export LD=ld.lld
+        
+        make O=out ${{ matrix.defconfig }}
+        
+        # Aplica overrides se necessário (ex: otimizações extras)
+        # scripts/config --file out/.config --disable CONFIG_DEBUG_INFO
+
+    - name: Build Kernel & Modules
+      run: |
+        export ARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        export CC=clang
+        export LD=ld.lld
+        export AR=llvm-ar
+        export NM=llvm-nm
+        export OBJCOPY=llvm-objcopy
+        export OBJDUMP=llvm-objdump
+        export STRIP=llvm-strip
+        
+        # Threads baseadas na máquina da GitHub (geralmente 2-4 vCPUs)
+        make O=out -j$(nproc --all) Image.gz modules dtbs
+        
+        echo "Build concluído com sucesso! 🚀"
+
+    - name: Package Artifacts
+      if: success()
+      run: |
+        mkdir -p artifacts
+        cp out/arch/arm64/boot/Image.gz artifacts/
+        cp out/arch/arm64/boot/dts/exynos/*.dtb artifacts/ || true # Ajuste conforme a plataforma exata
+        
+        # Empacota módulos
+        make O=out INSTALL_MOD_PATH=artifacts/modules modules_install
+        
+        # Cria um zip para facilitar o download
+        cd artifacts
+        zip -r ../Hunter-Kernel-${{ github.sha }}.zip .
+        cd ..
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Hunter-Kernel-Build
+        path: Hunter-Kernel-*.zip
+        retention-days: 5
